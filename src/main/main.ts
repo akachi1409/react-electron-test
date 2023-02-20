@@ -12,8 +12,16 @@ import path from 'path';
 import { app, BrowserWindow, shell, ipcMain } from 'electron';
 import { autoUpdater } from 'electron-updater';
 import log from 'electron-log';
+import Hyperswarm from 'hyperswarm';
+import Corestore from 'corestore';
+import Hyperbee from 'hyperbee';
+import b4a from 'b4a';
+import goodbye from 'graceful-goodbye';
+import { Node } from 'hyperbee/lib/messages.js'
 import MenuBuilder from './menu';
 import { resolveHtmlPath } from './util';
+
+require('dotenv').config();
 
 class AppUpdater {
   constructor() {
@@ -24,12 +32,13 @@ class AppUpdater {
 }
 
 let mainWindow: BrowserWindow | null = null;
+const conns = [];
 
-ipcMain.on('ipc-example', async (event, arg) => {
-  const msgTemplate = (pingPong: string) => `IPC test: ${pingPong}`;
-  console.log(msgTemplate(arg));
-  event.reply('ipc-example', msgTemplate('pong'));
-});
+// ipcMain.on('ipc-example', async (event, arg) => {
+//   const msgTemplate = (pingPong: string) => `IPC test: ${pingPong}`;
+//   console.log(msgTemplate(arg));
+//   event.reply('ipc-example', msgTemplate(arg));
+// });
 
 if (process.env.NODE_ENV === 'production') {
   const sourceMapSupport = require('source-map-support');
@@ -57,9 +66,38 @@ const installExtensions = async () => {
 };
 
 const createWindow = async () => {
+  const store = new Corestore('./storage');
+
+  const swarm = new Hyperswarm();
+  goodbye(() => swarm.destroy());
+
+  swarm.on('connection', (conn) => {
+    store.replicate(conn);
+    const name = b4a.toString(conn.remotePublicKey, 'hex');
+    console.log('*Got Connection:', name, '*');
+    conns.push(conn);
+  });
+
+  const core = store.get({ key: b4a.from(process.env.KEY, 'hex') });
+
+  const bee = new Hyperbee(core, {
+    keyEncoding: 'utf-8',
+    valueEncoding: 'utf-8',
+  });
+
+  await core.ready();
+
+  const foundPeers = store.findingPeers();
+  swarm.join(core.discoveryKey);
+  swarm.flush().then(() => foundPeers());
+
+  await core.update();
   if (isDebug) {
     await installExtensions();
   }
+
+  
+
 
   const RESOURCES_PATH = app.isPackaged
     ? path.join(process.resourcesPath, 'assets')
@@ -98,6 +136,33 @@ const createWindow = async () => {
     mainWindow = null;
   });
 
+  core.on('append', () => {
+    const seq = core.length - 1;
+    core.get(seq).then((block) => {
+      const buffer = Node.decode(block)
+      const data = JSON.parse(buffer.value.toString())
+      console.log("buffer", buffer);
+      console.log(`Decoded Block ${seq}`, data)
+      // mainWindow.webContents.send("contract:list", [data]);
+    });
+  });
+
+  ipcMain.on('contract:add', async (event, message) => {
+    // console.log("message", message);
+    for (const conn of conns) {
+      conn.write(`contractAdd${message}`);
+    }
+  });
+
+  // ipcMain.on('contract:list', async (event, message) => {
+  //   console.log('message1', message);
+  // });
+  const oldValue = []
+  for await (const { key, value } of bee.createReadStream()) {
+    oldValue.push(JSON.parse(value))
+  }
+  // console.log("oldValue: ", oldValue)
+  mainWindow.webContents.send("contract:list", oldValue);
   const menuBuilder = new MenuBuilder(mainWindow);
   menuBuilder.buildMenu();
 
